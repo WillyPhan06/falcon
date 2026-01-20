@@ -32,7 +32,11 @@ __all__ = (
     'after',
     'before',
     'BoundedStream',
+    'CachedResponse',
     'CORSMiddleware',
+    'IdempotencyMiddleware',
+    'IdempotencyStore',
+    'InMemoryIdempotencyStore',
     'HTTPError',
     'HTTPStatus',
     'HTTPFound',
@@ -413,7 +417,11 @@ from falcon.hooks import after
 from falcon.hooks import before
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
+from falcon.middleware import CachedResponse
 from falcon.middleware import CORSMiddleware
+from falcon.middleware import IdempotencyMiddleware
+from falcon.middleware import IdempotencyStore
+from falcon.middleware import InMemoryIdempotencyStore
 from falcon.redirects import HTTPFound
 from falcon.redirects import HTTPMovedPermanently
 from falcon.redirects import HTTPPermanentRedirect
