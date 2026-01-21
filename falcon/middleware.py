@@ -815,3 +815,156 @@ class CORSMiddleware(UniversalMiddlewareWithProcessResponse):
         req_succeeded: bool,
     ) -> None:
         self.process_response(req, resp, resource, req_succeeded)
+
+
+DEFAULT_REQUEST_ID_HEADER = 'X-Request-ID'
+
+
+class RequestIDMiddleware:
+    """Request ID Middleware.
+
+    This middleware automatically extracts a request ID from the incoming request
+    or generates one if not present. The request ID is stored in the request
+    context and added to the response headers for tracing and correlation purposes.
+
+    The request ID can be accessed in responders via ``req.context.request_id``
+    or via the ``req.request_id`` property (which reads the header value).
+
+    This is useful for:
+
+    * Distributed tracing across microservices
+    * Log correlation and debugging
+    * Request tracking through API gateways and load balancers
+
+    Keyword Arguments:
+        header_name (str): The name of the header to read/write the request ID.
+            Defaults to ``'X-Request-ID'``.
+        generator (callable): A callable that returns a new unique request ID.
+            If not specified, defaults to generating a UUID4 string.
+
+    Example:
+        Basic usage with default UUID generator::
+
+            import falcon
+
+            app = falcon.App(middleware=[
+                falcon.RequestIDMiddleware()
+            ])
+
+        With custom configuration::
+
+            import uuid
+
+            # Use a custom generator
+            def custom_generator():
+                return f'req-{uuid.uuid4().hex[:8]}'
+
+            middleware = falcon.RequestIDMiddleware(
+                header_name='X-Correlation-ID',
+                generator=custom_generator,
+            )
+            app = falcon.App(middleware=[middleware])
+
+        Accessing the request ID in a responder::
+
+            class MyResource:
+                def on_get(self, req, resp):
+                    # Access from context (works even if middleware generated it)
+                    request_id = req.context.request_id
+
+                    # Or from the header property (reads original header)
+                    request_id = req.request_id
+
+                    resp.media = {'request_id': request_id}
+
+    Note:
+        The request ID is always added to the response headers, regardless
+        of whether the request succeeded or failed.
+
+    Note:
+        For ASGI applications, this middleware uses async methods that
+        simply call their sync counterparts, as the operations are lightweight.
+
+    .. versionadded:: 4.1
+    """
+
+    def __init__(
+        self,
+        header_name: str = DEFAULT_REQUEST_ID_HEADER,
+        generator: Any = None,
+    ) -> None:
+        self._header_name = header_name
+        if generator is None:
+            import uuid
+
+            self._generator = lambda: str(uuid.uuid4())
+        else:
+            self._generator = generator
+
+    def _get_request_id(self, req: Request | AsgiRequest) -> str:
+        """Extract request ID from header or generate a new one."""
+        request_id = req.get_header(self._header_name)
+        if not request_id:
+            request_id = self._generator()
+        return request_id
+
+    def _apply_request_id(
+        self, req: Request | AsgiRequest, resp: Response | AsgiResponse
+    ) -> None:
+        """Apply request ID to the request context and response header.
+
+        This is the shared logic used by both WSGI and ASGI request processing.
+        It extracts the request ID from the incoming header or generates a new one,
+        stores it in the request context, and sets it on the response header.
+        """
+        request_id = self._get_request_id(req)
+        req.context.request_id = request_id
+        resp.set_header(self._header_name, request_id)
+
+    def _ensure_response_header(
+        self, req: Request | AsgiRequest, resp: Response | AsgiResponse
+    ) -> None:
+        """Ensure the request ID is present in the response headers.
+
+        This is the shared logic used by both WSGI and ASGI response processing.
+        It ensures the request ID is present in the response even if the request
+        failed before ``process_request`` completed.
+        """
+        request_id = getattr(req.context, 'request_id', None)
+        if request_id and not resp.get_header(self._header_name):
+            resp.set_header(self._header_name, request_id)
+
+    def process_request(self, req: Request, resp: Response) -> None:
+        """Process the request and assign a request ID (WSGI).
+
+        Extracts the request ID from the incoming header or generates
+        a new one if not present. Stores it in ``req.context.request_id``
+        and sets it on the response header.
+        """
+        self._apply_request_id(req, resp)
+
+    def process_response(
+        self, req: Request, resp: Response, resource: object, req_succeeded: bool
+    ) -> None:
+        """Ensure the request ID is in the response headers (WSGI).
+
+        This method ensures the request ID is present in the response even if
+        the request failed before ``process_request`` completed.
+        """
+        self._ensure_response_header(req, resp)
+
+    async def process_request_async(
+        self, req: AsgiRequest, resp: AsgiResponse
+    ) -> None:
+        """Process the request and assign a request ID (ASGI)."""
+        self._apply_request_id(req, resp)
+
+    async def process_response_async(
+        self,
+        req: AsgiRequest,
+        resp: AsgiResponse,
+        resource: object,
+        req_succeeded: bool,
+    ) -> None:
+        """Ensure the request ID is in the response headers (ASGI)."""
+        self._ensure_response_header(req, resp)

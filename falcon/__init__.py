@@ -37,6 +37,7 @@ __all__ = (
     'IdempotencyMiddleware',
     'IdempotencyStore',
     'InMemoryIdempotencyStore',
+    'RequestIDMiddleware',
     'HTTPError',
     'HTTPStatus',
     'HTTPFound',
@@ -422,6 +423,7 @@ from falcon.middleware import CORSMiddleware
 from falcon.middleware import IdempotencyMiddleware
 from falcon.middleware import IdempotencyStore
 from falcon.middleware import InMemoryIdempotencyStore
+from falcon.middleware import RequestIDMiddleware
 from falcon.redirects import HTTPFound
 from falcon.redirects import HTTPMovedPermanently
 from falcon.redirects import HTTPPermanentRedirect
