@@ -80,6 +80,7 @@ __all__ = (
     'HTTPPreconditionRequired',
     'HTTPRangeNotSatisfiable',
     'HTTPRequestHeaderFieldsTooLarge',
+    'HTTPRequestProcessingTimeout',
     'HTTPRouteNotFound',
     'HTTPServiceUnavailable',
     'HTTPTooManyRequests',
@@ -1967,6 +1968,83 @@ class HTTPServiceUnavailable(HTTPError):
             description=description,
             headers=_parse_retry_after(headers, retry_after),
             **kwargs,  # type: ignore[arg-type]
+        )
+
+
+class HTTPRequestProcessingTimeout(HTTPServiceUnavailable):
+    """503 Service Unavailable - Request Processing Timeout.
+
+    The request processing exceeded the configured timeout limit. This is
+    a server-side processing timeout, distinct from:
+
+    * 408 Request Timeout: Client delay in sending the request body
+    * 504 Gateway Timeout: Upstream server timeout in proxy scenarios
+
+    This exception is raised by :class:`~falcon.TimeoutMiddleware` when
+    request processing exceeds the configured time limit.
+
+    All the arguments are defined as keyword-only.
+
+    Keyword Args:
+        timeout (float): The timeout value in seconds that was exceeded.
+            Used to generate a default description if none is provided.
+        description (str): Human-friendly description of the error, along with
+            a helpful suggestion or two.
+        headers (dict or list): A ``dict`` of header names and values
+            to set, or a ``list`` of (*name*, *value*) tuples. Both *name* and
+            *value* must be of type ``str`` or ``StringType``, and only
+            character values 0x00 through 0xFF may be used on platforms that
+            use wide characters.
+
+            Note:
+                The Content-Type header, if present, will be overridden. If
+                you wish to return custom error messages, you can create
+                your own HTTP error class, and install an error handler
+                to convert it into an appropriate HTTP response for the
+                client
+
+            Note:
+                Falcon can process a list of ``tuple`` slightly faster
+                than a ``dict``.
+        retry_after (datetime or int): Value for the Retry-After header. If a
+            ``datetime`` object, will serialize as an HTTP date. Otherwise,
+            a non-negative ``int`` is expected, representing the number of
+            seconds to wait.
+
+            Note:
+                The existing value of the Retry-After in headers will be
+                overridden by this value
+        href (str): A URL someone can visit to find out more information
+            (default ``None``). Unicode characters are percent-encoded.
+        href_text (str): If href is given, use this as the friendly
+            title/description for the link (default 'API documentation
+            for this error').
+        code (int): An internal code that customers can reference in their
+            support request or to help them when searching for knowledge
+            base articles related to this error (default ``None``).
+
+    .. versionadded:: 4.1
+    """
+
+    def __init__(
+        self,
+        *,
+        timeout: float | None = None,
+        description: str | None = None,
+        retry_after: RetryAfter = None,
+        headers: HeaderArg | None = None,
+        **kwargs: HTTPErrorKeywordArguments,
+    ) -> None:
+        if description is None and timeout is not None:
+            description = (
+                f'Request processing exceeded the {timeout:.1f}s timeout limit.'
+            )
+        super().__init__(
+            title='Request Processing Timeout',
+            description=description,
+            retry_after=retry_after,
+            headers=headers,
+            **kwargs,
         )
 
 

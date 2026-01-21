@@ -38,6 +38,7 @@ __all__ = (
     'IdempotencyStore',
     'InMemoryIdempotencyStore',
     'RequestIDMiddleware',
+    'TimeoutMiddleware',
     'HTTPError',
     'HTTPStatus',
     'HTTPFound',
@@ -137,6 +138,7 @@ __all__ = (
     'HTTPPreconditionRequired',
     'HTTPRangeNotSatisfiable',
     'HTTPRequestHeaderFieldsTooLarge',
+    'HTTPRequestProcessingTimeout',
     'HTTPRouteNotFound',
     'HTTPServiceUnavailable',
     'HTTPTooManyRequests',
@@ -391,6 +393,7 @@ from falcon.errors import HTTPPreconditionFailed
 from falcon.errors import HTTPPreconditionRequired
 from falcon.errors import HTTPRangeNotSatisfiable
 from falcon.errors import HTTPRequestHeaderFieldsTooLarge
+from falcon.errors import HTTPRequestProcessingTimeout
 from falcon.errors import HTTPRouteNotFound
 from falcon.errors import HTTPServiceUnavailable
 from falcon.errors import HTTPTooManyRequests
@@ -424,6 +427,7 @@ from falcon.middleware import IdempotencyMiddleware
 from falcon.middleware import IdempotencyStore
 from falcon.middleware import InMemoryIdempotencyStore
 from falcon.middleware import RequestIDMiddleware
+from falcon.middleware import TimeoutMiddleware
 from falcon.redirects import HTTPFound
 from falcon.redirects import HTTPMovedPermanently
 from falcon.redirects import HTTPPermanentRedirect

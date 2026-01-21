@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+from collections.abc import Callable
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -10,6 +11,7 @@ from typing import Protocol
 from typing import TYPE_CHECKING
 
 from ._typing import UniversalMiddlewareWithProcessResponse
+from .errors import HTTPRequestProcessingTimeout
 from .util import code_to_http_status
 
 if TYPE_CHECKING:
@@ -968,3 +970,292 @@ class RequestIDMiddleware:
     ) -> None:
         """Ensure the request ID is in the response headers (ASGI)."""
         self._ensure_response_header(req, resp)
+
+
+DEFAULT_TIMEOUT = 30.0
+
+
+class TimeoutMiddleware:
+    """Request Processing Timeout Middleware.
+
+    This middleware enforces a timeout on request processing. When a request
+    takes longer than the configured timeout, a 503 Service Unavailable
+    response is returned via :class:`~falcon.HTTPRequestProcessingTimeout`.
+
+    Note:
+        **WSGI vs ASGI behavior**:
+
+        - **WSGI (synchronous)**: Timeout detection is "best effort" only.
+          The middleware checks elapsed time at middleware boundaries but cannot
+          actually interrupt running Python code. This serves as a safety net
+          and provides timeout reporting after the fact. For true timeout
+          enforcement in WSGI apps, use server-level timeouts (e.g., Gunicorn's
+          ``timeout`` setting).
+
+        - **ASGI (asynchronous)**: Timeout detection at middleware boundaries,
+          similar to WSGI. The elapsed time is checked before resource execution
+          and after response completion.
+
+    Keyword Arguments:
+        default_timeout (float): Default timeout limit in seconds for all requests.
+            Set to ``None`` to disable timeout by default. Defaults to 30.0.
+        timeout_resolver (callable): Optional function that returns a custom
+            timeout limit for each request. Signature: ``func(req, resp, resource)``
+            returning a float (timeout limit in seconds) or ``None`` (no timeout).
+            This is called after routing but before resource execution.
+            When provided, this overrides ``default_timeout`` for requests
+            where it returns a non-None value.
+
+            Warning:
+                The ``resource`` argument may be ``None`` in cases where routing
+                fails or no resource is matched (e.g., 404 responses). Your
+                resolver function should handle this case gracefully.
+
+        include_response_time (bool): If ``True``, add an ``X-Response-Time``
+            header showing actual processing time in milliseconds.
+            Defaults to ``False``.
+
+    Example:
+        Basic usage with default timeout::
+
+            import falcon
+
+            app = falcon.App(middleware=[
+                falcon.TimeoutMiddleware(default_timeout=30.0)
+            ])
+
+        With per-route timeouts::
+
+            def get_timeout(req, resp, resource):
+                # Longer timeout for specific paths
+                if req.path.startswith('/slow'):
+                    return 120.0  # 2 minutes
+                if req.path.startswith('/fast'):
+                    return 5.0
+                return None  # Use default
+
+            middleware = falcon.TimeoutMiddleware(
+                default_timeout=30.0,
+                timeout_resolver=get_timeout,
+            )
+            app = falcon.App(middleware=[middleware])
+
+        Resource-based timeouts::
+
+            def get_timeout(req, resp, resource):
+                return getattr(resource, 'timeout', None)
+
+            class SlowResource:
+                timeout = 60.0
+
+                def on_get(self, req, resp):
+                    # This route has a 60s timeout
+                    pass
+
+            middleware = falcon.TimeoutMiddleware(
+                default_timeout=30.0,
+                timeout_resolver=get_timeout,
+            )
+
+    .. versionadded:: 4.1
+    """
+
+    def __init__(
+        self,
+        default_timeout: float | None = DEFAULT_TIMEOUT,
+        timeout_resolver: Callable[
+            [Request | AsgiRequest, Response | AsgiResponse, object | None],
+            float | None,
+        ]
+        | None = None,
+        include_response_time: bool = False,
+    ) -> None:
+        self._default_timeout = default_timeout
+        self._timeout_resolver = timeout_resolver
+        self._include_response_time = include_response_time
+
+    # -------------------------------------------------------------------------
+    # Private Helper Methods
+    # -------------------------------------------------------------------------
+
+    def _get_timeout(
+        self,
+        req: Request | AsgiRequest,
+        resp: Response | AsgiResponse,
+        resource: object | None,
+    ) -> float | None:
+        """Determine the timeout limit for this request.
+
+        Args:
+            req: The request object.
+            resp: The response object.
+            resource: The matched resource object, or ``None`` if no resource
+                was matched (e.g., 404 responses).
+
+        Returns:
+            The timeout limit in seconds, or ``None`` if timeout is disabled.
+        """
+        if self._timeout_resolver is not None:
+            custom_timeout = self._timeout_resolver(req, resp, resource)
+            if custom_timeout is not None:
+                return custom_timeout
+        return self._default_timeout
+
+    def _record_start_time(self, req: Request | AsgiRequest) -> None:
+        """Record the request start time in the request context."""
+        req.context._timeout_start = time.monotonic()
+
+    def _check_and_store_timeout(
+        self,
+        req: Request | AsgiRequest,
+        resp: Response | AsgiResponse,
+        resource: object,
+    ) -> None:
+        """Determine timeout limit, store it, and check if already exceeded.
+
+        This method is called during the resource phase (after routing but
+        before resource execution). It determines the appropriate timeout limit,
+        stores it in the request context, and raises an error if the timeout
+        has already been exceeded.
+
+        Raises:
+            HTTPRequestProcessingTimeout: If the elapsed time already exceeds
+                the configured timeout limit.
+        """
+        timeout_limit = self._get_timeout(req, resp, resource)
+        req.context._timeout_limit = timeout_limit
+
+        if timeout_limit is not None:
+            start_time = getattr(req.context, '_timeout_start', None)
+            if start_time is not None:
+                elapsed = time.monotonic() - start_time
+                if elapsed > timeout_limit:
+                    self._raise_timeout_error(timeout_limit, elapsed)
+
+    def _check_response_timeout(
+        self,
+        req: Request | AsgiRequest,
+        resp: Response | AsgiResponse,
+        req_succeeded: bool,
+    ) -> None:
+        """Check elapsed time and optionally add response time header.
+
+        This method is called during the response phase. It calculates the
+        total elapsed time, optionally adds a response time header, and
+        raises a timeout error if the request exceeded the configured timeout limit.
+
+        Args:
+            req: The request object.
+            resp: The response object.
+            req_succeeded: Whether the request succeeded from the middleware
+                perspective. Timeout errors are only raised for successful
+                requests to avoid overriding existing error responses.
+
+        Raises:
+            HTTPRequestProcessingTimeout: If the request succeeded but exceeded
+                the configured timeout limit.
+        """
+        start_time = getattr(req.context, '_timeout_start', None)
+        if start_time is None:
+            return
+
+        elapsed = time.monotonic() - start_time
+
+        if self._include_response_time:
+            resp.set_header('X-Response-Time', f'{elapsed * 1000:.2f}ms')
+
+        timeout_limit = getattr(req.context, '_timeout_limit', None)
+        if timeout_limit is not None and elapsed > timeout_limit and req_succeeded:
+            self._raise_timeout_error(timeout_limit, elapsed)
+
+    def _raise_timeout_error(self, timeout_limit: float, elapsed: float) -> None:
+        """Raise a timeout error with a consistent, detailed message.
+
+        Args:
+            timeout_limit: The configured timeout limit in seconds.
+            elapsed: The actual elapsed time in seconds.
+
+        Raises:
+            HTTPRequestProcessingTimeout: Always raised with detailed message.
+        """
+        raise HTTPRequestProcessingTimeout(
+            timeout=timeout_limit,
+            description=(
+                f'Request processing exceeded the {timeout_limit:.1f}s '
+                f'timeout limit (actual: {elapsed:.1f}s).'
+            ),
+        )
+
+    # -------------------------------------------------------------------------
+    # WSGI Methods
+    # -------------------------------------------------------------------------
+
+    def process_request(self, req: Request, resp: Response) -> None:
+        """Record the request start time (WSGI)."""
+        self._record_start_time(req)
+
+    def process_resource(
+        self,
+        req: Request,
+        resp: Response,
+        resource: object,
+        params: dict[str, Any],
+    ) -> None:
+        """Determine and store timeout for this request (WSGI).
+
+        Also checks if the timeout has already been exceeded before
+        resource execution.
+        """
+        self._check_and_store_timeout(req, resp, resource)
+
+    def process_response(
+        self,
+        req: Request,
+        resp: Response,
+        resource: object,
+        req_succeeded: bool,
+    ) -> None:
+        """Check elapsed time and optionally add response time header (WSGI).
+
+        If the request exceeded the configured timeout and completed
+        successfully, raises :class:`~falcon.HTTPRequestProcessingTimeout`.
+        """
+        self._check_response_timeout(req, resp, req_succeeded)
+
+    # -------------------------------------------------------------------------
+    # ASGI Methods
+    # -------------------------------------------------------------------------
+
+    async def process_request_async(
+        self, req: AsgiRequest, resp: AsgiResponse
+    ) -> None:
+        """Record the request start time (ASGI)."""
+        self._record_start_time(req)
+
+    async def process_resource_async(
+        self,
+        req: AsgiRequest,
+        resp: AsgiResponse,
+        resource: object,
+        params: dict[str, Any],
+    ) -> None:
+        """Determine and store timeout for this request (ASGI).
+
+        Also checks if the timeout has already been exceeded before
+        resource execution.
+        """
+        self._check_and_store_timeout(req, resp, resource)
+
+    async def process_response_async(
+        self,
+        req: AsgiRequest,
+        resp: AsgiResponse,
+        resource: object,
+        req_succeeded: bool,
+    ) -> None:
+        """Check elapsed time and optionally add response time header (ASGI).
+
+        If the request exceeded the configured timeout and completed
+        successfully, raises :class:`~falcon.HTTPRequestProcessingTimeout`.
+        """
+        self._check_response_timeout(req, resp, req_succeeded)
