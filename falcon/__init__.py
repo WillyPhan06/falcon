@@ -33,9 +33,12 @@ __all__ = (
     'before',
     'BoundedStream',
     'CachedResponse',
+    'CacheMiddleware',
+    'CacheStore',
     'CORSMiddleware',
     'IdempotencyMiddleware',
     'IdempotencyStore',
+    'InMemoryCacheStore',
     'InMemoryIdempotencyStore',
     'RequestIDMiddleware',
     'TimeoutMiddleware',
@@ -422,9 +425,12 @@ from falcon.hooks import before
 from falcon.http_error import HTTPError
 from falcon.http_status import HTTPStatus
 from falcon.middleware import CachedResponse
+from falcon.middleware import CacheMiddleware
+from falcon.middleware import CacheStore
 from falcon.middleware import CORSMiddleware
 from falcon.middleware import IdempotencyMiddleware
 from falcon.middleware import IdempotencyStore
+from falcon.middleware import InMemoryCacheStore
 from falcon.middleware import InMemoryIdempotencyStore
 from falcon.middleware import RequestIDMiddleware
 from falcon.middleware import TimeoutMiddleware

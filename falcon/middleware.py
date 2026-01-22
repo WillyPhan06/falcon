@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import threading
 import time
+import urllib.parse
 from collections.abc import Callable
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -973,6 +974,563 @@ class RequestIDMiddleware:
 
 
 DEFAULT_TIMEOUT = 30.0
+
+DEFAULT_CACHE_TTL = 300  # 5 minutes in seconds
+DEFAULT_CACHE_METHODS = frozenset(['GET'])
+DEFAULT_INVALIDATION_METHODS = frozenset(['POST', 'PUT', 'PATCH', 'DELETE'])
+
+
+class CacheStore(Protocol):
+    """Protocol for cache stores.
+
+    Implementations of this protocol are used to store and retrieve cached
+    responses for GET requests. The store is responsible for managing
+    the lifecycle of cached entries, including expiration.
+
+    Example:
+        A simple Redis-based implementation might look like::
+
+            import json
+            import redis
+
+            class RedisCacheStore:
+                def __init__(self, redis_client, ttl=300):
+                    self.redis = redis_client
+                    self.ttl = ttl
+
+                def get(self, key):
+                    data = self.redis.get(f'cache:{key}')
+                    if data:
+                        d = json.loads(data)
+                        return CachedResponse(**d)
+                    return None
+
+                def set(self, key, response, ttl=None):
+                    ttl = ttl or self.ttl
+                    data = json.dumps({
+                        'status': response.status,
+                        'headers': response.headers,
+                        'media': response.media,
+                        'data': response.data.decode() if response.data else None,
+                        'text': response.text,
+                        'timestamp': response.timestamp,
+                    })
+                    self.redis.setex(f'cache:{key}', ttl, data)
+
+                def invalidate(self, key):
+                    self.redis.delete(f'cache:{key}')
+
+                def invalidate_prefix(self, prefix):
+                    keys = self.redis.keys(f'cache:{prefix}*')
+                    if keys:
+                        self.redis.delete(*keys)
+
+                async def get_async(self, key):
+                    return self.get(key)
+
+                async def set_async(self, key, response, ttl=None):
+                    self.set(key, response, ttl)
+
+                async def invalidate_async(self, key):
+                    self.invalidate(key)
+
+                async def invalidate_prefix_async(self, prefix):
+                    self.invalidate_prefix(prefix)
+    """
+
+    def get(self, key: str) -> CachedResponse | None:
+        """Retrieve a cached response by cache key.
+
+        Args:
+            key: The cache key to look up.
+
+        Returns:
+            The cached response if found and not expired, otherwise None.
+        """
+        ...
+
+    def set(self, key: str, response: CachedResponse, ttl: int | None = None) -> None:
+        """Store a cached response.
+
+        Args:
+            key: The cache key to store under.
+            response: The cached response data.
+            ttl: Optional time-to-live in seconds. If not provided,
+                the store's default TTL should be used.
+        """
+        ...
+
+    def invalidate(self, key: str) -> None:
+        """Invalidate (remove) a specific cached entry.
+
+        Args:
+            key: The cache key to invalidate.
+        """
+        ...
+
+    def invalidate_prefix(self, prefix: str) -> None:
+        """Invalidate all cached entries matching a prefix.
+
+        Args:
+            prefix: The prefix to match. All keys starting with this
+                prefix should be invalidated.
+        """
+        ...
+
+    async def get_async(self, key: str) -> CachedResponse | None:
+        """Async version of get().
+
+        Args:
+            key: The cache key to look up.
+
+        Returns:
+            The cached response if found and not expired, otherwise None.
+        """
+        ...
+
+    async def set_async(
+        self, key: str, response: CachedResponse, ttl: int | None = None
+    ) -> None:
+        """Async version of set().
+
+        Args:
+            key: The cache key to store under.
+            response: The cached response data.
+            ttl: Optional time-to-live in seconds. If not provided,
+                the store's default TTL should be used.
+        """
+        ...
+
+    async def invalidate_async(self, key: str) -> None:
+        """Async version of invalidate().
+
+        Args:
+            key: The cache key to invalidate.
+        """
+        ...
+
+    async def invalidate_prefix_async(self, prefix: str) -> None:
+        """Async version of invalidate_prefix().
+
+        Args:
+            prefix: The prefix to match. All keys starting with this
+                prefix should be invalidated.
+        """
+        ...
+
+
+class InMemoryCacheStore:
+    """In-memory implementation of CacheStore.
+
+    This store keeps cached responses in memory using a dictionary. It is
+    suitable for development, testing, and single-process deployments.
+
+    Warning:
+        This store does not share state between multiple processes. For
+        multi-process deployments (e.g., behind a load balancer), consider
+        using a distributed store such as Redis.
+
+    Warning:
+        This store has no maximum size limit. For production use with high
+        traffic, consider implementing a store with LRU eviction or using
+        an external cache.
+
+    Keyword Arguments:
+        ttl (int): Default time-to-live for cached entries in seconds.
+            Defaults to 300 (5 minutes).
+
+    Example:
+        Create and use an in-memory store::
+
+            store = InMemoryCacheStore(ttl=60)  # 1 minute TTL
+            app = falcon.App(middleware=[
+                CacheMiddleware(store=store)
+            ])
+    """
+
+    def __init__(self, ttl: int = DEFAULT_CACHE_TTL) -> None:
+        self._cache: dict[str, CachedResponse] = {}
+        self._lock = threading.Lock()
+        self.ttl = ttl
+
+    def _is_expired(self, response: CachedResponse, ttl: int | None = None) -> bool:
+        """Check if a cached response has expired."""
+        ttl = ttl if ttl is not None else self.ttl
+        return time.time() - response.timestamp > ttl
+
+    def _cleanup_expired(self) -> None:
+        """Remove expired entries from the cache."""
+        now = time.time()
+        expired_keys = [
+            key
+            for key, resp in self._cache.items()
+            if now - resp.timestamp > self.ttl
+        ]
+        for key in expired_keys:
+            del self._cache[key]
+
+    def get(self, key: str) -> CachedResponse | None:
+        """Retrieve a cached response by cache key.
+
+        Args:
+            key: The cache key to look up.
+
+        Returns:
+            The cached response if found and not expired, otherwise None.
+        """
+        with self._lock:
+            response = self._cache.get(key)
+            if response is None:
+                return None
+            if self._is_expired(response):
+                del self._cache[key]
+                return None
+            return response
+
+    def set(self, key: str, response: CachedResponse, ttl: int | None = None) -> None:
+        """Store a cached response.
+
+        Args:
+            key: The cache key to store under.
+            response: The cached response data.
+            ttl: Optional time-to-live in seconds (not used for storage,
+                entries use the store's default TTL for expiration checks).
+        """
+        with self._lock:
+            # Periodic cleanup to prevent unbounded growth
+            if len(self._cache) > 1000:
+                self._cleanup_expired()
+            self._cache[key] = response
+
+    def invalidate(self, key: str) -> None:
+        """Invalidate (remove) a specific cached entry.
+
+        Args:
+            key: The cache key to invalidate.
+        """
+        with self._lock:
+            if key in self._cache:
+                del self._cache[key]
+
+    def invalidate_prefix(self, prefix: str) -> None:
+        """Invalidate all cached entries matching a prefix.
+
+        Args:
+            prefix: The prefix to match. All keys starting with this
+                prefix should be invalidated.
+        """
+        with self._lock:
+            keys_to_remove = [
+                key for key in self._cache.keys() if key.startswith(prefix)
+            ]
+            for key in keys_to_remove:
+                del self._cache[key]
+
+    async def get_async(self, key: str) -> CachedResponse | None:
+        """Async version of get().
+
+        Note:
+            This implementation simply calls the synchronous version since
+            in-memory operations are fast enough not to block the event loop.
+        """
+        return self.get(key)
+
+    async def set_async(
+        self, key: str, response: CachedResponse, ttl: int | None = None
+    ) -> None:
+        """Async version of set().
+
+        Note:
+            This implementation simply calls the synchronous version since
+            in-memory operations are fast enough not to block the event loop.
+        """
+        self.set(key, response, ttl)
+
+    async def invalidate_async(self, key: str) -> None:
+        """Async version of invalidate().
+
+        Note:
+            This implementation simply calls the synchronous version since
+            in-memory operations are fast enough not to block the event loop.
+        """
+        self.invalidate(key)
+
+    async def invalidate_prefix_async(self, prefix: str) -> None:
+        """Async version of invalidate_prefix().
+
+        Note:
+            This implementation simply calls the synchronous version since
+            in-memory operations are fast enough not to block the event loop.
+        """
+        self.invalidate_prefix(prefix)
+
+
+class CacheMiddleware:
+    """Response Caching Middleware.
+
+    This middleware caches responses to GET requests based on the request URI
+    and query string, allowing subsequent identical requests to be served from
+    cache without re-executing the resource handler.
+
+    Cache entries are automatically invalidated when non-GET requests (POST,
+    PUT, PATCH, DELETE) are made to the same path, ensuring data consistency.
+
+    This is useful for:
+
+    * Reducing server load for frequently accessed read-only endpoints
+    * Improving response times for expensive GET operations
+    * Caching API responses that don't change frequently
+
+    Keyword Arguments:
+        store (CacheStore): The storage backend for cached responses.
+            Defaults to an :class:`InMemoryCacheStore` instance.
+        ttl (int): Time-to-live for cached responses in seconds.
+            Defaults to 300 (5 minutes).
+        methods (Iterable[str]): HTTP methods to cache responses for.
+            Defaults to ``('GET',)``. Only GET requests are cacheable by
+            default since other methods typically have side effects.
+        invalidation_methods (Iterable[str]): HTTP methods that should
+            invalidate cache entries for the same path. Defaults to
+            ``('POST', 'PUT', 'PATCH', 'DELETE')``.
+
+    Example:
+        Basic usage with default in-memory store::
+
+            import falcon
+
+            app = falcon.App(middleware=[
+                falcon.CacheMiddleware()
+            ])
+
+        With custom configuration::
+
+            middleware = falcon.CacheMiddleware(
+                ttl=60,  # 1 minute
+            )
+            app = falcon.App(middleware=[middleware])
+
+        With a custom store (e.g., Redis)::
+
+            redis_store = MyRedisCacheStore(redis_client)
+            app = falcon.App(middleware=[
+                falcon.CacheMiddleware(store=redis_store)
+            ])
+
+    Note:
+        The cache key is based on the request path and query string.
+        Different query parameters will result in different cache entries.
+
+    Note:
+        For ASGI applications, this middleware uses async storage operations
+        via ``get_async``, ``set_async``, etc. methods on the store.
+
+    Note:
+        Cache invalidation is performed based on the request path only
+        (without query string). This means a POST to ``/items`` will
+        invalidate cache entries for ``/items``, ``/items?page=1``, etc.
+    """
+
+    def __init__(
+        self,
+        store: CacheStore | None = None,
+        ttl: int = DEFAULT_CACHE_TTL,
+        methods: Iterable[str] = ('GET',),
+        invalidation_methods: Iterable[str] = ('POST', 'PUT', 'PATCH', 'DELETE'),
+    ) -> None:
+        self._store = store if store is not None else InMemoryCacheStore(ttl=ttl)
+        self._ttl = ttl
+        self._methods = frozenset(m.upper() for m in methods)
+        self._invalidation_methods = frozenset(m.upper() for m in invalidation_methods)
+
+    def _normalize_query_string(self, query_string: str) -> str:
+        """Normalize a query string by sorting parameters alphabetically.
+
+        This ensures that query strings with the same parameters but in different
+        order produce the same cache key. For example, ``foo=1&bar=2`` and
+        ``bar=2&foo=1`` will both normalize to ``bar=2&foo=1``.
+
+        Args:
+            query_string: The raw query string to normalize.
+
+        Returns:
+            The normalized query string with parameters sorted alphabetically.
+        """
+        if not query_string:
+            return ''
+        # Parse query string into list of (key, value) pairs
+        params = urllib.parse.parse_qsl(query_string, keep_blank_values=True)
+        # Sort by key, then by value for consistent ordering
+        params.sort()
+        # Re-encode to query string
+        return urllib.parse.urlencode(params)
+
+    def _create_cache_key(self, req: Request | AsgiRequest) -> str:
+        """Create a unique cache key from request attributes.
+
+        The cache key combines the request path and normalized query string to
+        ensure uniqueness across different endpoints and query parameters.
+        Query parameters are sorted alphabetically so that requests with the
+        same parameters in different order will use the same cache entry.
+        """
+        query_string = req.query_string
+        if query_string:
+            normalized_query = self._normalize_query_string(query_string)
+            if normalized_query:
+                return f'{req.path}?{normalized_query}'
+        return req.path
+
+    def _create_invalidation_prefix(self, req: Request | AsgiRequest) -> str:
+        """Create the prefix to use for cache invalidation.
+
+        This returns just the path so that all cache entries for that path
+        (regardless of query string) are invalidated.
+        """
+        return req.path
+
+    def _restore_response(
+        self, resp: Response | AsgiResponse, cached: CachedResponse
+    ) -> None:
+        """Restore a cached response to the response object."""
+        resp.status = cached.status
+        for name, value in cached.headers.items():
+            resp.set_header(name, value)
+        if cached.media is not None:
+            resp.media = cached.media
+        elif cached.data is not None:
+            resp.data = cached.data
+        elif cached.text is not None:
+            resp.text = cached.text
+
+    def _normalize_status(self, status: str | int) -> str:
+        """Normalize status to string format.
+
+        Args:
+            status: The status code or string.
+
+        Returns:
+            A status string like '200 OK' or '201 Created'.
+        """
+        if isinstance(status, int):
+            return code_to_http_status(status)
+        return str(status)
+
+    def _capture_response(self, resp: Response | AsgiResponse) -> CachedResponse:
+        """Capture the current response state for caching.
+
+        Note:
+            This method uses the public ``media``, ``data``, and ``text``
+            properties of the Response object to capture the response state.
+        """
+        return CachedResponse(
+            status=self._normalize_status(resp.status),
+            headers=resp.headers,
+            media=resp.media,
+            data=resp.data,
+            text=resp.text,
+            timestamp=time.time(),
+        )
+
+    def process_request(self, req: Request, resp: Response) -> None:
+        """Process the request before routing (WSGI).
+
+        For cacheable methods (GET by default), checks if a cached response
+        exists and returns it if found.
+
+        For invalidation methods (POST, PUT, PATCH, DELETE by default),
+        invalidates any cached entries for the request path.
+        """
+        # Handle cache invalidation for modifying requests
+        if req.method in self._invalidation_methods:
+            prefix = self._create_invalidation_prefix(req)
+            self._store.invalidate_prefix(prefix)
+            return
+
+        # Only cache configured methods
+        if req.method not in self._methods:
+            return
+
+        cache_key = self._create_cache_key(req)
+        cached = self._store.get(cache_key)
+
+        if cached is not None:
+            self._restore_response(resp, cached)
+            resp.complete = True
+            return
+
+        # Mark that we need to cache this response
+        req.context._cache_key = cache_key
+
+    def process_response(
+        self, req: Request, resp: Response, resource: object, req_succeeded: bool
+    ) -> None:
+        """Process the response after routing (WSGI).
+
+        If the request was cacheable and succeeded, cache the response.
+        """
+        cache_key = getattr(req.context, '_cache_key', None)
+        if cache_key is None:
+            return
+
+        # Only cache successful responses
+        if not req_succeeded:
+            return
+
+        cached_response = self._capture_response(resp)
+        self._store.set(cache_key, cached_response, self._ttl)
+
+    async def process_request_async(
+        self, req: AsgiRequest, resp: AsgiResponse
+    ) -> None:
+        """Process the request before routing (ASGI).
+
+        For cacheable methods (GET by default), checks if a cached response
+        exists and returns it if found.
+
+        For invalidation methods (POST, PUT, PATCH, DELETE by default),
+        invalidates any cached entries for the request path.
+        """
+        # Handle cache invalidation for modifying requests
+        if req.method in self._invalidation_methods:
+            prefix = self._create_invalidation_prefix(req)
+            await self._store.invalidate_prefix_async(prefix)
+            return
+
+        # Only cache configured methods
+        if req.method not in self._methods:
+            return
+
+        cache_key = self._create_cache_key(req)
+        cached = await self._store.get_async(cache_key)
+
+        if cached is not None:
+            self._restore_response(resp, cached)
+            resp.complete = True
+            return
+
+        # Mark that we need to cache this response
+        req.context._cache_key = cache_key
+
+    async def process_response_async(
+        self,
+        req: AsgiRequest,
+        resp: AsgiResponse,
+        resource: object,
+        req_succeeded: bool,
+    ) -> None:
+        """Process the response after routing (ASGI).
+
+        If the request was cacheable and succeeded, cache the response.
+        """
+        cache_key = getattr(req.context, '_cache_key', None)
+        if cache_key is None:
+            return
+
+        # Only cache successful responses
+        if not req_succeeded:
+            return
+
+        cached_response = self._capture_response(resp)
+        await self._store.set_async(cache_key, cached_response, self._ttl)
 
 
 class TimeoutMiddleware:
